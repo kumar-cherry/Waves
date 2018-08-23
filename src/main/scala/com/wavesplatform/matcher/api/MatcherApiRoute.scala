@@ -16,7 +16,7 @@ import com.wavesplatform.matcher.market.MatcherTransactionWriter.GetTransactions
 import com.wavesplatform.matcher.market.OrderBookActor._
 import com.wavesplatform.matcher.market.OrderHistoryActor._
 import com.wavesplatform.matcher.model.MatcherModel.{Level, Price}
-import com.wavesplatform.matcher.model.{LevelAgg, LimitOrder, OrderBook, OrderInfo}
+import com.wavesplatform.matcher.model._
 import com.wavesplatform.matcher.{AssetPairBuilder, MatcherSettings}
 import com.wavesplatform.metrics.TimerExt
 import com.wavesplatform.settings.RestAPISettings
@@ -189,6 +189,31 @@ case class MatcherApiRoute(wallet: Wallet,
     }
   }
 
+  private def cancelOrder(orderId: ByteStr, senderPublicKey: Option[PublicKeyAccount]): ToResponseMarshallable = {
+    DBUtils.orderInfo(db, orderId).status match {
+      case LimitOrder.NotFound => StatusCodes.NotFound
+      case status if status.isFinal => StatusCodes.BadRequest -> Json.obj("message" -> "Order is already terminated")
+      case _ =>
+        DBUtils.order(db, orderId) match {
+          case None =>
+            log.warn(s"Order $orderId was not found in history")
+            StatusCodes.NotFound
+          case Some(order) if senderPublicKey.exists(_ != order.senderPublicKey) =>
+            StatusCodes.BadRequest -> Json.obj("message" -> "Public Key mismatch")
+          case Some(order) =>
+            orderBook(order.assetPair) match {
+              case Some(orderBookRef) =>
+
+              case None =>
+                log.debug(s"Order book for ${order.assetPair} was not found, cancelling $orderId anyway")
+                orderHistory ! OrderHistoryActor.ForceCancelOrderFromHistory(orderId)
+            }
+            // todo: forward cancel order request to order book
+            ???
+        }
+    }
+  }
+
   @Path("/orderbook/{amountAsset}/{priceAsset}/cancel")
   @ApiOperation(
     value = "Cancel order",
@@ -242,6 +267,26 @@ case class MatcherApiRoute(wallet: Wallet,
       }
     }
   }
+
+  @Path("/orders/cancel/{orderId}")
+  @ApiOperation(value = "Cancel Order by ID without signature", notes = "Cancel Order by ID without signature", httpMethod = "POST")
+  @ApiImplicitParams(
+    Array(
+      new ApiImplicitParam(name = "orderId", value = "Order Id", required = true, dataType = "string", paramType = "path")
+    ))
+  def forceCancelOrder: Route = (path("orders" / "cancel" / ByteStrPM) & post & withAuth) { orderId =>
+    implicit val timeout: Timeout = Timeout(10.seconds)
+    val resp: Future[MatcherResponse] = (orderHistory ? ForceCancelOrderFromHistory(orderId)).flatMap {
+      case Some(order: Order) => (matcher ? ForceCancelOrder(orderId)).mapTo[MatcherResponse]
+      case None =>
+        Future {
+          OrderCancelRejected("Order not found")
+        }
+    }
+
+    complete(resp.map(r => r.code -> r.json))
+  }
+
   @Path("/orderbook/{amountAsset}/{priceAsset}/delete")
   @ApiOperation(
     value = "Delete Order from History by Id",
@@ -351,25 +396,6 @@ case class MatcherApiRoute(wallet: Wallet,
     require(math.abs(ts - NTP.correctedTime()).millis < matcherSettings.maxTimestampDiff, "Incorrect timestamp")
     require(crypto.verify(sig, pk.publicKey ++ Longs.toByteArray(ts), pk.publicKey), "Incorrect signature")
     pk
-  }
-
-  @Path("/orders/cancel/{orderId}")
-  @ApiOperation(value = "Cancel Order by ID without signature", notes = "Cancel Order by ID without signature", httpMethod = "POST")
-  @ApiImplicitParams(
-    Array(
-      new ApiImplicitParam(name = "orderId", value = "Order Id", required = true, dataType = "string", paramType = "path")
-    ))
-  def forceCancelOrder: Route = (path("orders" / "cancel" / ByteStrPM) & post & withAuth) { orderId =>
-    implicit val timeout: Timeout = Timeout(10.seconds)
-    val resp: Future[MatcherResponse] = (orderHistory ? ForceCancelOrderFromHistory(orderId)).flatMap {
-      case Some(order: Order) => (matcher ? ForceCancelOrder(order.assetPair, orderId)).mapTo[MatcherResponse]
-      case None =>
-        Future {
-          OrderCancelRejected("Order not found")
-        }
-    }
-
-    complete(resp.map(r => r.code -> r.json))
   }
 
   @Path("/orders/{address}")

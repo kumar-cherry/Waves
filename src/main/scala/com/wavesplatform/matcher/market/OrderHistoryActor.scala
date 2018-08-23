@@ -42,8 +42,6 @@ class OrderHistoryActor(db: DB, val settings: MatcherSettings, val utxPool: UtxP
   def processExpirableRequest(r: Any): Unit = r match {
     case ValidateOrder(o, _) =>
       sender() ! ValidateOrderResult(o.id(), validateNewOrder(o))
-    case ValidateCancelOrder(co, _) =>
-      sender() ! ValidateCancelResult(co.orderId, validateCancelOrder(co))
     case req: DeleteOrderFromHistory =>
       deleteFromOrderHistory(req)
     case GetTradableBalance(assetPair, addr, _) =>
@@ -61,8 +59,6 @@ class OrderHistoryActor(db: DB, val settings: MatcherSettings, val utxPool: UtxP
       executedTimer.measure(orderHistory.orderExecuted(ev))
     case ev: OrderCanceled =>
       cancelledTimer.measure(orderHistory.orderCanceled(ev))
-    case RecoverFromOrderBook(ob) =>
-      recoverFromOrderBook(ob)
     case ForceCancelOrderFromHistory(id) =>
       forceCancelOrder(id)
   }
@@ -112,18 +108,6 @@ class OrderHistoryActor(db: DB, val settings: MatcherSettings, val utxPool: UtxP
           .foreach(orderData => delete(orderData._1.id()))
     }
   }
-
-  def recoverFromOrderBook(ob: OrderBook): Unit = {
-    ob.asks.foreach {
-      case (_, orders) =>
-        orders.foreach(o => orderHistory.orderAccepted(OrderAdded(o)))
-    }
-    ob.bids.foreach {
-      case (_, orders) =>
-        orders.foreach(o => orderHistory.orderAccepted(OrderAdded(o)))
-    }
-  }
-
 }
 
 object OrderHistoryActor {
@@ -135,9 +119,8 @@ object OrderHistoryActor {
   def props(db: DB, settings: MatcherSettings, utxPool: UtxPool, wallet: Wallet): Props =
     Props(new OrderHistoryActor(db, settings, utxPool, wallet))
 
-  sealed trait OrderHistoryRequest
 
-  sealed trait ExpirableOrderHistoryRequest extends OrderHistoryRequest {
+  sealed trait ExpirableOrderHistoryRequest {
     def ts: Long
   }
 
@@ -147,13 +130,9 @@ object OrderHistoryActor {
 
   case class ValidateOrderResult(validatedOrderId: ByteStr, result: Either[GenericError, Order])
 
-  case class ValidateCancelOrder(cancel: CancelOrder, ts: Long) extends ExpirableOrderHistoryRequest
-
   case class ValidateCancelResult(validatedOrderId: ByteStr, result: Either[GenericError, CancelOrder])
 
-  case class RecoverFromOrderBook(ob: OrderBook) extends OrderHistoryRequest
-
-  case class ForceCancelOrderFromHistory(orderId: ByteStr) extends OrderHistoryRequest
+  case class ForceCancelOrderFromHistory(orderId: ByteStr)
 
   case object OrderDeletingAccepted extends MatcherResponse {
     val json: JsObject            = Json.obj("status" -> "Accepted")

@@ -88,7 +88,7 @@ class OrderBookActor(assetPair: AssetPair,
       onAddOrder(order)
     case cancel: CancelOrder =>
       onCancelOrder(cancel)
-    case ForceCancelOrder(_, orderId) =>
+    case ForceCancelOrder(orderId) =>
       log.trace(s"Force cancel order $orderId")
       onForceCancelOrder(orderId)
     case OrderCleanup =>
@@ -101,12 +101,11 @@ class OrderBookActor(assetPair: AssetPair,
 
     case SaveSnapshotSuccess(metadata) =>
       lastSnapshotSequenceNr = metadata.sequenceNr
-      log.info(s"Snapshot saved with metadata $metadata")
       deleteMessages(metadata.sequenceNr)
       deleteSnapshots(SnapshotSelectionCriteria.Latest.copy(maxSequenceNr = metadata.sequenceNr - 1))
 
     case SaveSnapshotFailure(metadata, reason) =>
-      log.error(s"Failed to save snapshot: $metadata, $reason.")
+      log.error(s"Failed to save snapshot: $metadata", reason)
       if (shutdownStatus.initiated) {
         shutdownStatus = shutdownStatus.copy(
           oldSnapshotsDeleted = true,
@@ -174,31 +173,21 @@ class OrderBookActor(assetPair: AssetPair,
       }
   }
 
-  private def waitingValidation(sentMessage: Either[ValidateCancelOrder, ValidateOrder]): Receive = readOnlyCommands orElse {
+  private def waitingValidation(sentMessage: ValidateOrder): Receive = readOnlyCommands orElse {
     case ValidationTimeoutExceeded =>
       validationTimeouts.increment()
       log.warn(s"Validation timeout exceeded for $sentMessage")
-      val orderId = sentMessage.fold(_.cancel.orderId, _.order.id())
+      val orderId = sentMessage.order.id()
       cancelInProgressOrders.invalidate(orderId)
       apiSender.foreach(_ ! OperationTimedOut)
       becomeFullCommands()
 
     case ValidateOrderResult(validatedOrderId, res) =>
-      sentMessage match {
-        case Right(sent) if validatedOrderId == sent.order.id() =>
-          cancellable.foreach(_.cancel())
-          handleValidateOrderResult(res)
-        case x =>
-          log.warn(s"Unexpected message: $x")
-      }
-
-    case ValidateCancelResult(validatedOrderId, res) =>
-      sentMessage match {
-        case Left(sent) if validatedOrderId == sent.cancel.orderId =>
-          cancellable.foreach(_.cancel())
-          handleValidateCancelResult(res.map(x => x.orderId))
-        case x =>
-          log.warn(s"Unexpected message: $x")
+      if (validatedOrderId == sentMessage.order.id()) {
+        cancellable.foreach(_.cancel())
+        handleValidateOrderResult(res)
+      } else {
+        log.warn(s"Unexpected ValidateOrderResult for order $validatedOrderId while waiting for ${sentMessage.order.id()}")
       }
 
     case cancel: CancelOrder if Option(cancelInProgressOrders.getIfPresent(cancel.orderId)).nonEmpty =>
@@ -291,7 +280,7 @@ class OrderBookActor(assetPair: AssetPair,
     orderHistory ! msg
     apiSender = Some(sender())
     cancellable = Some(context.system.scheduler.scheduleOnce(settings.validationTimeout, self, ValidationTimeoutExceeded))
-    context.become(waitingValidation(Right(msg)))
+    context.become(waitingValidation(msg))
   }
 
   private def handleValidateOrderResult(res: Either[GenericError, Order]): Unit = {
@@ -421,14 +410,9 @@ class OrderBookActor(assetPair: AssetPair,
 
   override def receiveCommand: Receive = fullCommands
 
-  val isMigrateToNewOrderHistoryStorage: Boolean = settings.isMigrateToNewOrderHistoryStorage
-
   override def receiveRecover: Receive = {
     case evt: Event =>
       applyEvent(evt)
-      if (isMigrateToNewOrderHistoryStorage) {
-        orderHistory ! evt
-      }
 
     case RecoveryCompleted =>
       log.info(assetPair.toString() + " - Recovery completed!")
@@ -438,9 +422,6 @@ class OrderBookActor(assetPair: AssetPair,
       lastSnapshotSequenceNr = metadata.sequenceNr
       orderBook = snapshot.orderBook
       updateSnapshot(orderBook)
-      if (isMigrateToNewOrderHistoryStorage) {
-        orderHistory ! RecoverFromOrderBook(orderBook)
-      }
       log.debug(s"Recovering OrderBook from snapshot: $snapshot for $persistenceId")
   }
 
@@ -479,18 +460,15 @@ object OrderBookActor {
     def tryComplete(): Unit = if (completed) onComplete()
   }
 
-  //protocol
-  sealed trait OrderBookRequest {
-    def assetPair: AssetPair
-  }
+  case class DeleteOrderBookRequest(assetPair: AssetPair)
 
-  case class DeleteOrderBookRequest(assetPair: AssetPair) extends OrderBookRequest
+  case class DeleteOrderBookRequest(assetPair: AssetPair)
 
-  case class CancelOrder(assetPair: AssetPair, sender: PublicKeyAccount, orderId: ByteStr) extends OrderBookRequest {
+  case class CancelOrder(assetPair: AssetPair, sender: PublicKeyAccount, orderId: ByteStr) {
     override lazy val toString: String = s"CancelOrder($assetPair, $sender, $orderId)"
   }
 
-  case class ForceCancelOrder(assetPair: AssetPair, orderId: ByteStr) extends OrderBookRequest
+  case class ForceCancelOrder(orderId: ByteStr)
 
   case object OrderCleanup
 
